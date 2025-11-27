@@ -1,5 +1,54 @@
+# Environment
 .env
 venv/
 __pycache__/
 .DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Uploaded documents (RAG)
+uploads/
+uploaded_docs/
+temp/
+tmp/
+
+# Dataset PDFs (Supreme Court judgments)
+data/**/*.pdf
+data/**/*.txt
+data/**/*.doc
+data/**/*.docx
+data/**/*.html
+
+# FAISS index files
+faiss_index/
+*.index
+*.faiss
+*.bin
+*.pkl
+*.npy
+
+# Embeddings / chunk outputs
+chunks/
+embedded_docs/
+processed_docs/
+
+# Model files
+models/
+*.pt
+*.bin
+*.h5
+
+# Python artifacts
+*.pyc
+*.pyo
+
+# Streamlit cache
+.streamlit/
+
+# Output folders
 Outputs/
