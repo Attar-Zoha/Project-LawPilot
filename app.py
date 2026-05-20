@@ -1,22 +1,31 @@
 import pickle
-from langchain.schema import Document as LCDocument  # renamed to avoid clash with python-docx
+import os, time, json, glob
 
 import streamlit as st
-import os, time, json, glob
 from dotenv import load_dotenv
-import fitz, torch
-from docx import Document
-import google.generativeai as genai
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_community.vectorstores import FAISS
-from langchain.chains.question_answering import load_qa_chain
-from langchain.chains.summarize import load_summarize_chain
-from langchain.prompts import PromptTemplate
-from transformers import AutoTokenizer, AutoModel
+
+import fitz  # PyMuPDF
+import torch
 import numpy as np
 import faiss
+import pyperclip
+
+from docx import Document as DocxDocument
+
+from google import genai
+
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+# from langchain.llms import GoogleGenerativeAI
+# from langchain.chains.question_answering import load_qa_chain
+# from langchain.chains.summarize import load_summarize_chain
+
+from langchain.prompts import PromptTemplate
+from langchain_community.vectorstores import FAISS
+
+
+from transformers import AutoTokenizer, AutoModel
 
 from load_corpus import load_local_corpus
 
@@ -26,35 +35,43 @@ api_key = os.getenv("API_KEY")
 if not api_key:
     st.error("Google API Key missing. Please add it to .env as API_KEY.")
     st.stop()
-genai.configure(api_key=api_key)
+client = genai.Client(api_key=api_key)
 
 # ---------------- SAFE TEXT EXTRACTION ----------------
-def safe_extract_text(resp):
-    try:
-        if hasattr(resp, "text") and resp.text:
-            return resp.text
-        if hasattr(resp, "candidates") and resp.candidates:
-            parts = resp.candidates[0].content.parts
-            if parts and hasattr(parts[0], "text"):
-                return parts[0].text
-    except Exception:
-        pass
-    return "(No content returned)"
+# def safe_extract_text(resp):
+#     try:
+#         if hasattr(resp, "text") and resp.text:
+#             return resp.text
+#         if hasattr(resp, "candidates") and resp.candidates:
+#             parts = resp.candidates[0].content.parts
+#             if parts and hasattr(parts[0], "text"):
+#                 return parts[0].text
+#     except Exception:
+#         pass
+#     return "(No content returned)"
 
 # ---------------- GEMINI CALL ----------------
 def robust_generate(prompt, retries=2):
-    for model_name in ["gemini-2.5-flash", "gemini-1.5-flash"]:
-        model = genai.GenerativeModel(model_name)
+    models = ["gemini-2.5-flash", "gemini-2.0-flash"]
+
+    for model_name in models:
         for _ in range(retries + 1):
             try:
-                r = model.generate_content(prompt)
-                t = safe_extract_text(r)
-                if t.strip():
-                    return t
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt
+                )
+
+                if response and response.text:
+                    return response.text
+                
+
             except Exception as e:
+                st.error(f"Gemini error: {e}")
                 if "429" in str(e):
                     break
                 time.sleep(1)
+
     return "(Error generating response)"
 
 # ---------------- FILE HANDLING ----------------
@@ -66,7 +83,7 @@ def get_document_text(files):
             for p in doc:
                 txt += p.get_text()
         elif f.name.endswith(".docx"):
-            d = Document(f)
+            d = DocxDocument(f)
             for para in d.paragraphs:
                 txt += para.text + "\n"
     return txt
@@ -125,48 +142,55 @@ def get_vector_store(chunks, model_name="law-ai/InLegalBERT"):
             model_kwargs={"device": "cuda" if torch.cuda.is_available() else "cpu"},
         )
         vs = FAISS.from_texts(chunks, embedding=emb)
-        st.session_state.vector_store, st.session_state.raw_text = vs, "\n".join(chunks)
+        # st.session_state.vector_store, st.session_state.raw_text = vs, "\n".join(chunks)
+        st.session_state.vector_store = vs
+        st.session_state.chunks = chunks
+        st.session_state.raw_text = "\n".join(chunks[:3])
         st.sidebar.success("Documents processed ✅")
     except Exception as e:
         st.error(f"Embedding error: {e}")
 
 # ---------------- CHAINS ----------------
-def get_conversational_chain():
-    """QA chain with structured legal prompt for Document QA (RAG)."""
-    p = PromptTemplate(
-    template="""
-You are LawPilot, a professional legal research assistant.
-Use ONLY the provided context from Indian Supreme Court judgments to answer the user's question.
-Do NOT add any information from outside sources.
-Answer in a detailed, accurate, and structured way using the format below.
-If any information is not available in the context, write 'Not specified in retrieved context.'
+# # def get_conversational_chain():
+#     """QA chain with structured legal prompt for Document QA (RAG)."""
+#     p = PromptTemplate(
+#         template="""
+#         You are LawPilot, a professional legal research assistant.
+#         Use ONLY the provided context from Indian Supreme Court judgments to answer the user's question.
+#         Do NOT add any information from outside sources.
+#         Answer in a detailed, accurate, and structured way using the format below.
+#         If any information is not available in the context, write 'Not specified in retrieved context.'
 
-Question: {question}
-Context: {context}
+#         Question: {question}
+#         Context: {context}
 
-Answer in the following format:
-Case Name: 
-Year: 
-Key Holdings: 
-Reasoning: 
-Majority/Dissent Points: 
-Relevant Articles/Citations: 
-Notes: 
-""",
-    input_variables=["context", "question"],
-)
+#         Answer in the following format:
+#         Case Name: 
+#         Year: 
+#         Key Holdings: 
+#         Reasoning: 
+#         Majority/Dissent Points: 
+#         Relevant Articles/Citations: 
+#         Notes: 
+#         """,
+#         input_variables=["context", "question"],
+#     )
 
-    model = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash", 
-        temperature=0.3, 
-        google_api_key=api_key
-    )
+#     model = GoogleGenerativeAI(
+#     model="models/gemini-1.5-flash",
+#     temperature=0.3,
+#     google_api_key=api_key
+# )
 
-    return load_qa_chain(model, chain_type="stuff", prompt=p)
+#     return load_qa_chain(model, chain_type="stuff", prompt=p)
 
-def get_summary_chain():
-    m = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2, google_api_key=api_key)
-    return load_summarize_chain(m, chain_type="map_reduce")
+# def get_summary_chain():
+#     m = GoogleGenerativeAI(
+#         model="models/gemini-1.5-flash",
+#         temperature=0.2,
+#         google_api_key=api_key
+#     )
+#     return load_summarize_chain(m, chain_type="map_reduce")
 
 # ---------------- PRECEDENT PROMPT & HANDLER ----------------
 precedent_prompt = PromptTemplate(
@@ -180,15 +204,24 @@ Precedent Context: {context}
 
 Provide a detailed, professional answer suitable for a legal professional in the following format. Each item should appear on a new line:
 
-1️. Case Name:  
-2️. Year of Decision:  
-3️. Domain: (e.g., Constitutional Law, Consumer Law, Criminal Law, Employment, Environmental Law, Tax/GST/Income, Other)  
+1. Case Name:
+
+2. Year of Decision:  
+
+3. Domain: (e.g., Constitutional Law, Consumer Law, Criminal Law, Employment, Environmental Law, Tax/GST/Income, Other)  
+
 4. Subject Matter: (Brief description of what the case was about)  
-5️. Judgment: (Outcome / decision of the Court)  
-6️. Key Holdings / Ratio Decidendi:  
-7️. Reasoning / Court Observations:  
-8️. Majority / Dissenting Opinions:  
-9️. Relevant Articles / Sections / Citations:  
+
+5. Judgment: (Outcome / decision of the Court)  
+
+6. Key Holdings / Ratio Decidendi:  
+
+7. Reasoning / Court Observations:  
+
+8. Majority / Dissenting Opinions:  
+
+9. Relevant Articles / Sections / Citations:  
+
 10. Practical Notes / Implications for Legal Practice:  
 
 Ensure clarity, precision, and professional tone suitable for referencing in legal work.
@@ -196,26 +229,53 @@ Ensure clarity, precision, and professional tone suitable for referencing in leg
     input_variables=["context", "question"]
 )
 
-
 def handle_precedent_qna(q):
-    if "vector_store" not in st.session_state or not st.session_state.vector_store:
-        return "⚠️ Legal corpus not loaded. Please load Supreme Court judgments first."
-    
+    if not st.session_state.vector_store:
+        return "⚠️ Load legal corpus first."
+
     docs = st.session_state.vector_store.similarity_search(q, k=3)
-    context = "\n".join([doc.page_content for doc in docs])
+    context = "\n\n".join([d.page_content for d in docs])
 
-    model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.3, google_api_key=api_key)
-    chain = load_qa_chain(model, chain_type="stuff", prompt=precedent_prompt)
-
-    res = chain({"input_documents": docs, "question": q}, return_only_outputs=True)
-    return res["output_text"]
+    prompt = precedent_prompt.format(
+        context=context,
+        question=q
+    )
+    return robust_generate(prompt)
 
 # ---------------- HANDLERS ----------------
 def handle_doc_qna(q):
-    docs = st.session_state.vector_store.similarity_search(q)
-    c = get_conversational_chain()
-    r = c({"input_documents": docs, "question": q}, return_only_outputs=True)
-    return r["output_text"]
+    if not st.session_state.vector_store:
+        return "⚠️ Upload and process documents first."
+
+    docs = st.session_state.vector_store.similarity_search(q, k=4)
+
+    context = "\n\n".join([d.page_content for d in docs])
+
+    # Recent chat history
+    history = "\n".join(
+        [f"{r}: {m}" for r, m in st.session_state.chat_history[-4:]]
+    )
+
+    prompt = f"""
+        You are LawPilot, a legal assistant.
+
+        Use ONLY the following document context and conversation history.
+
+        Conversation History:
+        {history}
+
+        Document Context:
+        {context}
+
+        Current Question:
+        {q}
+
+        If answer is unavailable, say:
+        "Not specified in the document."
+
+        Answer in a clear, structured legal format.
+        """
+    return robust_generate(prompt)
 
 def handle_general_qna(user_question):
     if "legal_index" in st.session_state and st.session_state.legal_index:
@@ -232,18 +292,31 @@ def handle_general_qna(user_question):
         return robust_generate(prompt)
 
 def generate_summary(instr):
-    if "raw_text" not in st.session_state or not st.session_state.raw_text:
-        st.error("Upload a document first.")
-        return
-    docs = RecursiveCharacterTextSplitter(chunk_size=8000, chunk_overlap=800).create_documents(
-        [st.session_state.raw_text]
-    )
-    chain = get_summary_chain()
-    with st.spinner("Summarizing..."):
-        init = chain.run(docs)
-        refined = robust_generate(f"Refine this summary as per '{instr}'.\n\n{init}")
-    st.session_state.chat_history.append(("LawPilot", f"**Summary ({instr})**\n\n{refined}"))
 
+    if not st.session_state.vector_store:
+        return "Upload and process documents first."
+
+    # Retrieve relevant chunks instead of full document
+    docs = st.session_state.vector_store.similarity_search(
+        "summary of legal document",
+        k=4
+    )
+
+    context = "\n\n".join([d.page_content for d in docs])
+
+    prompt = f"""
+        Summarize the following legal document.
+
+        Instruction:
+        {instr}
+
+        Document:
+        {context}
+        """
+
+    return robust_generate(prompt)
+
+    
 def translate_text(text, lang):
     return robust_generate(f"Translate to {lang}: {text}")
 
@@ -292,11 +365,48 @@ with st.sidebar:
 
     st.write("---")
 
-    # --- Summarize Uploaded Docs ---
+   # --- Summarize Uploaded Docs ---
     if st.session_state.vector_store:
-        ins = st.text_input("Custom Instruction", "Provide a concise legal summary.")
+
+        st.subheader("Document Summary")
+
+        ins = st.text_input(
+            "Custom Instruction",
+            "Provide a concise legal summary."
+        )
+
         if st.button("Generate Summary"):
-            generate_summary(ins)
+
+            with st.spinner("Generating summary..."):
+
+                summary = generate_summary(ins)
+
+                st.session_state.summary_output = summary
+
+        # DISPLAY SUMMARY
+        if "summary_output" in st.session_state:
+
+            st.text_area(
+                "Generated Summary",
+                st.session_state.summary_output,
+                height=300
+            )
+
+        # --- Chat History Preview ---
+    st.subheader("Chat History")
+
+    if st.session_state.chat_history:
+
+        for role, msg in st.session_state.chat_history[-5:]:
+
+            if role == "You":
+                st.markdown(f"👤 **You:** {msg[:80]}")
+
+            else:
+                st.markdown(f"🤖 **LawPilot:** {msg[:80]}...")
+
+    else:
+        st.caption("No chat history yet.")
 
     if st.button("Clear Chat"):
         st.session_state.chat_history = []
@@ -307,11 +417,29 @@ with st.sidebar:
 st.title("⚖️ LawPilot – Legal AI Assistant")
 chat_tab, trans_tab = st.tabs(["Chat", "Translate"])
 
+# # --- Chat Tab ---
+# with chat_tab:
+#     for role, msg in st.session_state.chat_history:
+#         with st.chat_message(role, avatar="👤" if role == "You" else "🤖"):
+#             st.markdown(msg)
+
 # --- Chat Tab ---
 with chat_tab:
-    for role, msg in st.session_state.chat_history:
+    for idx, (role, msg) in enumerate(st.session_state.chat_history):
+
         with st.chat_message(role, avatar="👤" if role == "You" else "🤖"):
+
+            # Show message normally
             st.markdown(msg)
+
+            # Copy button only for LawPilot responses
+            if role == "LawPilot":
+
+                if st.button("📋 Copy Response", key=f"copy_{idx}"):
+
+                    pyperclip.copy(msg)
+
+                    st.success("Response copied to clipboard.")
 
 # --- Translate Tab ---
 with trans_tab:
@@ -342,3 +470,5 @@ if prompt:
     
     st.session_state.chat_history.append(("LawPilot", ans))
     st.rerun()
+
+
